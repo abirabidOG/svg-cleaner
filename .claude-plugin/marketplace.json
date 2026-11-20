@@ -1,0 +1,1 @@
+{"name":"svg-cleaner","owner":{"email":"abir.abid.43@gmail.com","name":"Abid Mahmud"},"plugins":[{"description":"Clean and shrink SVG files from Claude Code. Safe and Maximum presets, local SVGO, nothing uploaded.","name":"svg-cleaner","source":"./plugins/svg-cleaner","version":"0.1.0"}]}
