@@ -376,7 +376,7 @@ export default function SvgOptimizerTool() {
       <div className="text-center space-y-4">
         <div className="inline-flex items-center gap-2 rounded-full bg-[#5846F6]/10 px-3.5 py-1 text-xs font-bold text-[#5846F6] border border-[#5846F6]/20">
           <Sparkles className="h-3.5 w-3.5" />
-          <span>Phase 2 Enhanced • Web / Icon / Print Presets • SVG to PNG Rasterizer</span>
+          <span>Web / Icon / Print Presets • SVG to PNG Rasterizer • 100% Free</span>
         </div>
         <h1 className="text-3xl sm:text-4xl md:text-5xl font-extrabold tracking-tight text-[#0B0B0D]">
           Free SVG Optimizer & Cleaner
