@@ -17,23 +17,35 @@ import {
   Layers,
   ArrowRight,
   Eye,
-  Plus,
   Trash2,
+  Table,
+  Image as ImageIcon,
+  FolderOpen,
+  Code2,
 } from 'lucide-react';
 import JSZip from 'jszip';
 import {
   type CleaningOptions,
   type OptimizeResult,
+  PRESET_OPTIONS,
   DEFAULT_SAFE_OPTIONS,
   MAXIMUM_OPTIONS,
   optimizeSvgString,
+  rasterizeSvgToPng,
+  getFilesFromDataTransfer,
   formatBytes,
 } from '../lib/svgOptimizer';
 import { SAMPLE_SVG_CONTENT, SAMPLE_SVG_NAME } from '../lib/sampleSvg';
-import { trackSvgOptimized, trackDownloadSvgClean } from '../lib/analytics';
+import {
+  trackSvgOptimized,
+  trackDownloadSvgClean,
+  trackCodePasted,
+  trackSvgToPng,
+  trackPresetChanged,
+} from '../lib/analytics';
 
-const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
-const MAX_FILES = 20;
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_FILES = 50;
 
 interface UploadedSvgFile {
   id: string;
@@ -45,28 +57,46 @@ interface UploadedSvgFile {
 export default function SvgOptimizerTool() {
   const [files, setFiles] = useState<UploadedSvgFile[]>([]);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
-  const [options, setOptions] = useState<CleaningOptions>(DEFAULT_SAFE_OPTIONS);
-  const [preset, setPreset] = useState<'safe' | 'maximum' | 'custom'>('safe');
+  const [options, setOptions] = useState<CleaningOptions>(PRESET_OPTIONS.web);
+  const [activePreset, setActivePreset] = useState<'web' | 'icon' | 'print' | 'custom'>('web');
+
+  // Input Mode: File Upload vs Direct Code Paste
+  const [inputMode, setInputMode] = useState<'upload' | 'paste'>('upload');
+  const [pastedCode, setPastedCode] = useState<string>('');
+
+  // View Mode: Preview vs Code View vs Results Table
+  const [activeViewTab, setActiveViewTab] = useState<'preview' | 'code' | 'table'>('preview');
+
+  // PNG Rasterizer Options (Phase 2)
+  const [pngDimension, setPngDimension] = useState<512 | 1024 | 2000>(1024);
+  const [pngBackground, setPngBackground] = useState<'transparent' | 'white'>('transparent');
+  const [isRasterizing, setIsRasterizing] = useState<boolean>(false);
+
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [copiedCode, setCopiedCode] = useState(false);
-  const [isDragging, setIsDragging] = useState(false);
-  const [isZipping, setIsZipping] = useState(false);
+  const [feedbackToast, setFeedbackToast] = useState<string | null>(null);
+  const [copiedCode, setCopiedCode] = useState<boolean>(false);
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [isZipping, setIsZipping] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   // Active file
   const activeFile = useMemo(() => {
     return files.find((f) => f.id === activeFileId) || files[0] || null;
   }, [files, activeFileId]);
 
-  // Clear copied notification after 2 seconds
+  // Clear toast after 2.5s
   useEffect(() => {
-    if (!copiedCode) return;
-    const timer = setTimeout(() => setCopiedCode(false), 2000);
+    if (!copiedCode && !feedbackToast) return;
+    const timer = setTimeout(() => {
+      setCopiedCode(false);
+      setFeedbackToast(null);
+    }, 2500);
     return () => clearTimeout(timer);
-  }, [copiedCode]);
+  }, [copiedCode, feedbackToast]);
 
-  // Recalculate optimization on active file or all files when options change
+  // Re-optimize all files when options change
   const reoptimizeFiles = useCallback(
     (targetOptions: CleaningOptions, currentFiles: UploadedSvgFile[]) => {
       return currentFiles.map((f) => {
@@ -81,24 +111,25 @@ export default function SvgOptimizerTool() {
     []
   );
 
-  const handlePresetSelect = (newPreset: 'safe' | 'maximum') => {
-    setPreset(newPreset);
-    const newOptions = newPreset === 'safe' ? DEFAULT_SAFE_OPTIONS : MAXIMUM_OPTIONS;
+  const handlePresetSelect = (presetKey: 'web' | 'icon' | 'print') => {
+    setActivePreset(presetKey);
+    const newOptions = PRESET_OPTIONS[presetKey];
     setOptions(newOptions);
     setFiles((prev) => reoptimizeFiles(newOptions, prev));
+    trackPresetChanged(presetKey);
 
     if (activeFile) {
       trackSvgOptimized({
         original_bytes: activeFile.result.originalBytes,
         cleaned_bytes: activeFile.result.cleanedBytes,
         savings_percent: activeFile.result.savingsPercent,
-        preset: newPreset,
+        preset: 'custom',
       });
     }
   };
 
   const handleOptionToggle = (key: keyof CleaningOptions) => {
-    setPreset('custom');
+    setActivePreset('custom');
     const newOptions: CleaningOptions = {
       ...options,
       [key]: !options[key],
@@ -107,8 +138,9 @@ export default function SvgOptimizerTool() {
     setFiles((prev) => reoptimizeFiles(newOptions, prev));
   };
 
+  // Process incoming raw file list
   const handleFiles = useCallback(
-    (fileList: FileList | File[]) => {
+    async (fileList: FileList | File[]) => {
       setErrorMessage(null);
       const incoming = Array.from(fileList);
 
@@ -121,99 +153,157 @@ export default function SvgOptimizerTool() {
 
       for (const file of incoming) {
         if (!file.name.toLowerCase().endsWith('.svg') && file.type !== 'image/svg+xml') {
-          setErrorMessage(`"${file.name}" is not an SVG file. Please upload SVG files only.`);
-          return;
+          continue;
         }
 
         if (file.size > MAX_FILE_SIZE_BYTES) {
           setErrorMessage(
-            `"${file.name}" is over 5 MB (${(file.size / (1024 * 1024)).toFixed(1)} MB). Maximum allowed is 5 MB.`
+            `"${file.name}" is over 10 MB (${(file.size / (1024 * 1024)).toFixed(1)} MB). Maximum allowed is 10 MB.`
           );
           return;
         }
 
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const rawText = e.target?.result as string;
-          try {
-            const result = optimizeSvgString(rawText, options);
-            const item: UploadedSvgFile = {
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-              name: file.name,
-              originalRaw: rawText,
-              result,
-            };
+        const text = await file.text();
+        try {
+          const result = optimizeSvgString(text, options);
+          newUploadedFiles.push({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            name: file.name,
+            originalRaw: text,
+            result,
+          });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : 'Failed to parse SVG';
+          setErrorMessage(`Error in "${file.name}": ${msg}`);
+        }
+      }
 
-            setFiles((prev) => {
-              const updated = [...prev, item];
-              if (!activeFileId) setActiveFileId(item.id);
-              return updated;
-            });
-
-            trackSvgOptimized({
-              original_bytes: result.originalBytes,
-              cleaned_bytes: result.cleanedBytes,
-              savings_percent: result.savingsPercent,
-              preset,
-            });
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : 'Invalid SVG content';
-            setErrorMessage(`Failed to process "${file.name}": ${msg}`);
-          }
-        };
-        reader.readAsText(file);
+      if (newUploadedFiles.length > 0) {
+        setFiles((prev) => {
+          const updated = [...prev, ...newUploadedFiles];
+          if (!activeFileId) setActiveFileId(newUploadedFiles[0].id);
+          return updated;
+        });
+        setFeedbackToast(`Processed ${newUploadedFiles.length} SVG file${newUploadedFiles.length > 1 ? 's' : ''}!`);
       }
     },
-    [files.length, activeFileId, options, preset]
+    [files.length, options, activeFileId]
   );
 
-  const handleSampleClick = () => {
-    setErrorMessage(null);
+  // Folder drag & drop handler (Phase 2)
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer) {
+      try {
+        const extractedFiles = await getFilesFromDataTransfer(e.dataTransfer);
+        if (extractedFiles.length > 0) {
+          await handleFiles(extractedFiles);
+        } else if (e.dataTransfer.files.length > 0) {
+          await handleFiles(e.dataTransfer.files);
+        }
+      } catch {
+        if (e.dataTransfer.files.length > 0) {
+          await handleFiles(e.dataTransfer.files);
+        }
+      }
+    }
+  };
+
+  // Direct Code Paste Handler (Phase 2)
+  const handleProcessPastedCode = () => {
+    if (!pastedCode.trim()) {
+      setErrorMessage('Please paste valid SVG markup into the textarea.');
+      return;
+    }
+
+    try {
+      const result = optimizeSvgString(pastedCode.trim(), options);
+      const newFile: UploadedSvgFile = {
+        id: `pasted-${Date.now()}`,
+        name: `pasted-icon-${files.length + 1}.svg`,
+        originalRaw: pastedCode.trim(),
+        result,
+      };
+
+      setFiles((prev) => [newFile, ...prev]);
+      setActiveFileId(newFile.id);
+      trackCodePasted(pastedCode.length);
+      setFeedbackToast('Cleaned pasted SVG successfully!');
+      setPastedCode('');
+      setInputMode('upload');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Invalid SVG code';
+      setErrorMessage(msg);
+    }
+  };
+
+  const handleLoadSample = () => {
     try {
       const result = optimizeSvgString(SAMPLE_SVG_CONTENT, options);
       const sampleItem: UploadedSvgFile = {
-        id: `sample-${Date.now()}`,
+        id: 'sample-icon',
         name: SAMPLE_SVG_NAME,
         originalRaw: SAMPLE_SVG_CONTENT,
         result,
       };
-
       setFiles([sampleItem]);
       setActiveFileId(sampleItem.id);
-
-      trackSvgOptimized({
-        original_bytes: result.originalBytes,
-        cleaned_bytes: result.cleanedBytes,
-        savings_percent: result.savingsPercent,
-        preset,
-      });
+      setFeedbackToast('Loaded sample SVG vector with editor metadata.');
     } catch {
       setErrorMessage('Could not load sample SVG.');
     }
   };
 
-  const handleDownloadSingle = () => {
+  // Copy SVG Code
+  const handleCopyCode = () => {
     if (!activeFile) return;
-    const blob = new Blob([activeFile.result.cleanedSvg], {
+    navigator.clipboard.writeText(activeFile.result.cleanedSvg);
+    setCopiedCode(true);
+    setFeedbackToast('Optimized SVG code copied to clipboard!');
+  };
+
+  // Download Single SVG
+  const handleDownloadSingleSvg = (fileItem: UploadedSvgFile) => {
+    const blob = new Blob([fileItem.result.cleanedSvg], {
       type: 'image/svg+xml;charset=utf-8',
     });
     const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    const cleanName = activeFile.name.replace(/\.svg$/i, '') + '-cleaned.svg';
-    link.download = cleanName;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileItem.name.replace(/\.svg$/i, '') + '-cleaned.svg';
+    a.click();
     URL.revokeObjectURL(url);
 
     trackDownloadSvgClean({
       format: 'svg',
       files_count: 1,
-      total_savings_bytes: activeFile.result.savingsBytes,
+      total_savings_bytes: fileItem.result.savingsBytes,
     });
   };
 
+  // SVG to PNG Rasterizer (Phase 2)
+  const handleRasterizePng = async () => {
+    if (!activeFile) return;
+    setIsRasterizing(true);
+    try {
+      const blob = await rasterizeSvgToPng(activeFile.result.cleanedSvg, pngDimension, pngBackground);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${activeFile.name.replace(/\.svg$/i, '')}-${pngDimension}px.png`;
+      a.click();
+      URL.revokeObjectURL(url);
+      trackSvgToPng(pngDimension, pngBackground);
+      setFeedbackToast(`Exported ${pngDimension}px PNG (${pngBackground})!`);
+    } catch (err) {
+      setErrorMessage('Failed to rasterize SVG to PNG.');
+    } finally {
+      setIsRasterizing(false);
+    }
+  };
+
+  // Download All as ZIP
   const handleDownloadAllZip = async () => {
     if (files.length === 0) return;
     setIsZipping(true);
@@ -229,12 +319,10 @@ export default function SvgOptimizerTool() {
 
       const blob = await zip.generateAsync({ type: 'blob' });
       const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `cleaned-svgs-${Date.now()}.zip`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'cleaned-svgs.zip';
+      a.click();
       URL.revokeObjectURL(url);
 
       trackDownloadSvgClean({
@@ -242,540 +330,591 @@ export default function SvgOptimizerTool() {
         files_count: files.length,
         total_savings_bytes: totalSavings,
       });
+
+      setFeedbackToast(`Downloaded ${files.length} cleaned SVGs in ZIP!`);
     } catch {
-      setErrorMessage('Failed to create ZIP archive.');
+      setErrorMessage('Could not generate ZIP archive.');
     } finally {
       setIsZipping(false);
     }
   };
 
-  const handleCopyCode = () => {
-    if (!activeFile) return;
-    const code = activeFile.result.cleanedSvg;
-    if (navigator.clipboard) {
-      navigator.clipboard.writeText(code);
-    } else {
-      const textarea = document.createElement('textarea');
-      textarea.value = code;
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
-    }
-    setCopiedCode(true);
-  };
-
-  const handleRemoveFile = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    const remaining = files.filter((f) => f.id !== id);
-    setFiles(remaining);
-    if (activeFileId === id) {
-      setActiveFileId(remaining.length > 0 ? remaining[0].id : null);
-    }
-  };
-
-  const handleClearAll = () => {
-    setFiles([]);
-    setActiveFileId(null);
-    setErrorMessage(null);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  const hasAggressiveActive =
-    options.roundCoordinates ||
-    options.shortenIds ||
-    options.removeDimensionsKeepViewBox ||
-    options.minifyCode;
+  // Total summary calculations
+  const totalOriginalBytes = files.reduce((acc, f) => acc + f.result.originalBytes, 0);
+  const totalCleanedBytes = files.reduce((acc, f) => acc + f.result.cleanedBytes, 0);
+  const totalSavedBytes = Math.max(0, totalOriginalBytes - totalCleanedBytes);
+  const totalSavingsPercent =
+    totalOriginalBytes > 0 ? Math.round((totalSavedBytes / totalOriginalBytes) * 100) : 0;
 
   return (
-    <div className="w-full">
-      {/* Error notification banner */}
+    <div className="w-full max-w-5xl mx-auto px-4 sm:px-6 space-y-8">
+      {/* Hidden File Inputs */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept=".svg,image/svg+xml"
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files) handleFiles(e.target.files);
+          e.target.value = '';
+        }}
+      />
+      <input
+        ref={folderInputRef}
+        type="file"
+        multiple
+        {...({ webkitdirectory: '', directory: '' } as any)}
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files) handleFiles(e.target.files);
+          e.target.value = '';
+        }}
+      />
+
+      {/* Hero Header */}
+      <div className="text-center space-y-4">
+        <div className="inline-flex items-center gap-2 rounded-full bg-[#5846F6]/10 px-3.5 py-1 text-xs font-bold text-[#5846F6] border border-[#5846F6]/20">
+          <Sparkles className="h-3.5 w-3.5" />
+          <span>Phase 2 Enhanced • Web / Icon / Print Presets • SVG to PNG Rasterizer</span>
+        </div>
+        <h1 className="text-3xl sm:text-4xl md:text-5xl font-extrabold tracking-tight text-[#0B0B0D]">
+          Free SVG Optimizer & Cleaner
+        </h1>
+        <p className="max-w-2xl mx-auto text-sm sm:text-base text-[#4F4E55] leading-relaxed">
+          Strip illustrator metadata, comments, unused IDs, and unneeded tags. Minify code or pretty-print,
+          view line numbers, and rasterize to PNG directly in your browser.
+        </p>
+      </div>
+
+      {/* Notifications */}
       {errorMessage && (
-        <div
-          role="alert"
-          className="mb-6 flex items-start justify-between rounded-2xl border border-red-200 bg-red-50/90 p-4 text-red-900 shadow-sm"
-        >
-          <div className="flex items-center gap-3">
-            <AlertCircle className="h-5 w-5 shrink-0 text-red-600" />
-            <p className="text-sm font-medium">{errorMessage}</p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setErrorMessage(null)}
-            className="rounded-lg p-1 text-red-600 hover:bg-red-100 transition-colors"
-            aria-label="Dismiss error"
-          >
+        <div className="flex items-start gap-3 rounded-2xl border border-rose-200 bg-rose-50 p-4 text-xs sm:text-sm text-rose-800">
+          <AlertCircle className="h-5 w-5 shrink-0 text-rose-600 mt-0.5" />
+          <div className="flex-1 font-semibold">{errorMessage}</div>
+          <button onClick={() => setErrorMessage(null)} className="text-rose-500">
             <X className="h-4 w-4" />
           </button>
         </div>
       )}
 
-      {/* Main Container */}
-      {files.length === 0 ? (
-        /* Empty Upload Zone */
-        <div className="rounded-3xl border border-[#E5E1D6] bg-white p-6 sm:p-10 shadow-sm">
-          <div
-            onDragOver={(e) => {
-              e.preventDefault();
-              setIsDragging(true);
-            }}
-            onDragLeave={(e) => {
-              e.preventDefault();
-              setIsDragging(false);
-            }}
-            onDrop={(e) => {
-              e.preventDefault();
-              setIsDragging(false);
-              if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                handleFiles(e.dataTransfer.files);
-              }
-            }}
-            onClick={() => fileInputRef.current?.click()}
-            className={`cursor-pointer rounded-2xl border-2 border-dashed p-8 sm:p-14 text-center transition-all ${
-              isDragging
-                ? 'border-[#1F8C7F] bg-[#EBF7F5]'
-                : 'border-[#E5E1D6] hover:border-[#1F8C7F] hover:bg-[#F4F2EC]/50'
-            }`}
-          >
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".svg,image/svg+xml"
-              multiple
-              className="hidden"
-              onChange={(e) => {
-                if (e.target.files && e.target.files.length > 0) {
-                  handleFiles(e.target.files);
-                }
-              }}
-            />
-
-            <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-[#F4F2EC] text-[#1F8C7F] mb-5 shadow-2xs">
-              <UploadCloud className="h-8 w-8" />
-            </div>
-
-            <h3 className="text-xl sm:text-2xl font-bold tracking-tight text-[#0B0B0D]">
-              Drop your SVG files here
-            </h3>
-            <p className="mt-2 text-sm text-[#4F4E55] max-w-md mx-auto">
-              Accepts <strong className="text-[#0B0B0D]">SVG</strong> up to 5 MB each.
-              Upload up to 20 files at once for batch cleaning.
-            </p>
-
-            <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  fileInputRef.current?.click();
-                }}
-                className="inline-flex min-h-[44px] items-center justify-center rounded-xl bg-[#0B0B0D] hover:bg-[#1F8C7F] text-white px-6 py-2.5 text-sm font-semibold transition-all shadow-sm"
-              >
-                Browse SVG Files
-              </button>
-
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleSampleClick();
-                }}
-                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl border border-[#E5E1D6] bg-white hover:bg-[#F4F2EC] px-5 py-2.5 text-sm font-semibold text-[#0B0B0D] transition-all shadow-2xs"
-              >
-                <Sparkles className="h-4 w-4 text-[#1F8C7F]" />
-                Try a sample SVG
-              </button>
-            </div>
-          </div>
+      {feedbackToast && (
+        <div className="flex items-start gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-xs sm:text-sm text-emerald-900 shadow-xs">
+          <Check className="h-5 w-5 shrink-0 text-emerald-600 mt-0.5" />
+          <div className="flex-1 font-semibold">{feedbackToast}</div>
         </div>
-      ) : (
-        /* Workspace with Batch Files & Optimization Controls */
-        <div className="space-y-8">
-          {/* Top Batch Bar */}
-          <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-[#E5E1D6] bg-white p-4 sm:p-5 shadow-2xs">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#F4F2EC] text-[#1F8C7F]">
-                <FileCode className="h-5 w-5" />
-              </div>
-              <div>
-                <p className="text-sm font-bold text-[#0B0B0D]">
-                  {files.length} {files.length === 1 ? 'SVG File' : 'SVG Files'} Loaded
-                </p>
-                <p className="text-xs text-[#4F4E55]">
-                  Select an SVG below to inspect Before and After previews
-                </p>
+      )}
+
+      {/* MAIN WORKSPACE */}
+      <div className="rounded-3xl border border-[#C9C7C1] bg-white p-5 sm:p-7 md:p-8 shadow-xs space-y-8">
+        {/* Upload Zone / Direct Paste Tabs (Phase 2) */}
+        {files.length === 0 ? (
+          <div className="space-y-4">
+            {/* Input Mode Switcher */}
+            <div className="flex justify-center">
+              <div className="inline-flex items-center gap-1 bg-[#F4F2EC] p-1 rounded-xl border border-[#C9C7C1]">
+                <button
+                  type="button"
+                  onClick={() => setInputMode('upload')}
+                  className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${
+                    inputMode === 'upload'
+                      ? 'bg-[#5846F6] text-white shadow-xs'
+                      : 'text-[#4F4E55] hover:text-[#0B0B0D]'
+                  }`}
+                >
+                  Upload SVG Files
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setInputMode('paste')}
+                  className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${
+                    inputMode === 'paste'
+                      ? 'bg-[#5846F6] text-white shadow-xs'
+                      : 'text-[#4F4E55] hover:text-[#0B0B0D]'
+                  }`}
+                >
+                  Paste SVG Code
+                </button>
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
-              {files.length < MAX_FILES && (
+            {inputMode === 'upload' ? (
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setIsDragging(true);
+                }}
+                onDragLeave={() => setIsDragging(false)}
+                onDrop={handleDrop}
+                className={`rounded-2xl border-2 border-dashed p-8 sm:p-12 text-center transition-all ${
+                  isDragging
+                    ? 'border-[#5846F6] bg-[#5846F6]/5 scale-[1.01]'
+                    : 'border-[#C9C7C1] bg-[#F4F2EC]/40 hover:bg-[#F4F2EC] hover:border-[#5846F6]'
+                }`}
+              >
+                <div className="max-w-md mx-auto space-y-4">
+                  <div className="flex h-16 w-16 mx-auto items-center justify-center rounded-2xl bg-white text-[#5846F6] shadow-xs border border-[#C9C7C1]">
+                    <UploadCloud className="h-8 w-8" />
+                  </div>
+
+                  <div className="space-y-1">
+                    <p className="text-base sm:text-lg font-bold text-[#0B0B0D]">
+                      Drag and drop SVG files or folders
+                    </p>
+                    <p className="text-xs sm:text-sm text-[#4F4E55]">
+                      Folder drag-and-drop supported • Up to 50 SVGs, 10 MB each
+                    </p>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-full bg-[#5846F6] hover:bg-[#4735E2] text-white px-6 py-3 text-sm font-bold shadow-md cursor-pointer"
+                    >
+                      <UploadCloud className="h-4 w-4" />
+                      <span>Browse Files</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => folderInputRef.current?.click()}
+                      className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-full border border-[#C9C7C1] bg-white hover:bg-[#F4F2EC] text-[#0B0B0D] px-5 py-3 text-sm font-semibold shadow-2xs"
+                    >
+                      <FolderOpen className="h-4 w-4 text-[#5846F6]" />
+                      <span>Select Folder</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleLoadSample}
+                      className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-full border border-[#C9C7C1] bg-white hover:bg-[#F4F2EC] text-[#0B0B0D] px-5 py-3 text-sm font-semibold shadow-2xs"
+                    >
+                      <Sparkles className="h-4 w-4 text-[#5846F6]" />
+                      <span>Try Sample</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              /* Direct SVG Code Paste Textarea (Phase 2) */
+              <div className="rounded-2xl border border-[#C9C7C1] bg-white p-5 space-y-4 shadow-xs">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-[#0B0B0D] flex items-center gap-2">
+                    <Code2 className="h-4 w-4 text-[#5846F6]" />
+                    <span>Paste Raw SVG Markup:</span>
+                  </label>
+                  <span className="text-[11px] text-[#4F4E55]">
+                    {pastedCode.length} characters
+                  </span>
+                </div>
+
+                <textarea
+                  value={pastedCode}
+                  onChange={(e) => setPastedCode(e.target.value)}
+                  placeholder="<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>...</svg>"
+                  rows={8}
+                  className="w-full rounded-xl border border-[#C9C7C1] p-3 text-xs font-mono text-[#0B0B0D] focus:border-[#5846F6] outline-hidden resize-y"
+                />
+
+                <div className="flex items-center justify-end gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setPastedCode('')}
+                    className="text-xs text-[#4F4E55] hover:text-[#0B0B0D]"
+                  >
+                    Clear
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleProcessPastedCode}
+                    className="inline-flex items-center gap-2 rounded-full bg-[#5846F6] hover:bg-[#4735E2] text-white px-5 py-2.5 text-xs font-bold shadow-md"
+                  >
+                    <Sparkles className="h-4 w-4" />
+                    <span>Clean Pasted SVG</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          /* WORKSPACE WITH LOADED SVGS */
+          <div className="space-y-6">
+            {/* Top Toolbar: Presets & View Tabs */}
+            <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#C9C7C1] pb-4">
+              {/* Presets: Web / Icon / Print (Phase 2) */}
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold uppercase tracking-wider text-[#4F4E55]">
+                  Presets:
+                </span>
+                <div className="flex items-center gap-1 bg-[#F4F2EC] p-1 rounded-xl border border-[#C9C7C1]">
+                  {(['web', 'icon', 'print'] as ('web' | 'icon' | 'print')[]).map((pKey) => (
+                    <button
+                      key={pKey}
+                      type="button"
+                      onClick={() => handlePresetSelect(pKey)}
+                      className={`px-3 py-1 text-xs font-bold uppercase rounded-lg transition-all ${
+                        activePreset === pKey
+                          ? 'bg-[#5846F6] text-white shadow-xs'
+                          : 'text-[#4F4E55] hover:text-[#0B0B0D]'
+                      }`}
+                    >
+                      {pKey}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* View Switcher: Preview, Code View with Line Numbers, Results Table */}
+              <div className="flex items-center gap-1 bg-[#F4F2EC] p-1 rounded-xl border border-[#C9C7C1]">
+                <button
+                  type="button"
+                  onClick={() => setActiveViewTab('preview')}
+                  className={`px-3 py-1 text-xs font-bold rounded-lg transition-all ${
+                    activeViewTab === 'preview'
+                      ? 'bg-white text-[#5846F6] shadow-2xs'
+                      : 'text-[#4F4E55] hover:text-[#0B0B0D]'
+                  }`}
+                >
+                  Visual Preview
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveViewTab('code')}
+                  className={`px-3 py-1 text-xs font-bold rounded-lg transition-all ${
+                    activeViewTab === 'code'
+                      ? 'bg-white text-[#5846F6] shadow-2xs'
+                      : 'text-[#4F4E55] hover:text-[#0B0B0D]'
+                  }`}
+                >
+                  Cleaned Code View
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveViewTab('table')}
+                  className={`px-3 py-1 text-xs font-bold rounded-lg transition-all ${
+                    activeViewTab === 'table'
+                      ? 'bg-white text-[#5846F6] shadow-2xs'
+                      : 'text-[#4F4E55] hover:text-[#0B0B0D]'
+                  }`}
+                >
+                  Results Table ({files.length})
+                </button>
+              </div>
+
+              {/* Add More & Clear */}
+              <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
-                  className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl border border-[#E5E1D6] bg-white hover:bg-[#F4F2EC] px-3.5 py-1.5 text-xs font-semibold text-[#0B0B0D] transition-all shadow-2xs"
+                  className="inline-flex items-center gap-1.5 rounded-full border border-[#C9C7C1] bg-white px-3 py-1.5 text-xs font-bold text-[#0B0B0D] hover:bg-[#F4F2EC]"
                 >
-                  <Plus className="h-3.5 w-3.5" />
-                  <span>Add more</span>
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={handleClearAll}
-                className="inline-flex min-h-[38px] items-center gap-1 rounded-xl border border-red-200 bg-white hover:bg-red-50 text-red-600 px-3 py-1.5 text-xs font-semibold transition-all"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                <span>Clear all</span>
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".svg,image/svg+xml"
-                multiple
-                className="hidden"
-                onChange={(e) => {
-                  if (e.target.files && e.target.files.length > 0) {
-                    handleFiles(e.target.files);
-                  }
-                }}
-              />
-            </div>
-          </div>
-
-          {/* Filmstrip Selector (when multiple files) */}
-          {files.length > 1 && (
-            <div className="flex gap-2.5 overflow-x-auto pb-2 pt-1 no-scrollbar">
-              {files.map((f) => {
-                const isActive = f.id === activeFile?.id;
-                return (
-                  <div
-                    key={f.id}
-                    onClick={() => setActiveFileId(f.id)}
-                    className={`group relative shrink-0 cursor-pointer rounded-2xl border-2 p-2.5 transition-all flex items-center gap-3 ${
-                      isActive
-                        ? 'border-[#1F8C7F] bg-[#EBF7F5]'
-                        : 'border-[#E5E1D6] bg-white hover:border-[#4F4E55]'
-                    }`}
-                  >
-                    <div className="h-10 w-10 rounded-xl overflow-hidden bg-white border border-[#E5E1D6] flex items-center justify-center p-1">
-                      <div
-                        className="h-full w-full flex items-center justify-center"
-                        dangerouslySetInnerHTML={{ __html: f.result.cleanedSvg }}
-                      />
-                    </div>
-                    <div className="text-left pr-2">
-                      <p className="text-xs font-bold text-[#0B0B0D] max-w-[130px] truncate">
-                        {f.name}
-                      </p>
-                      <p className="text-[11px] font-mono text-[#1F8C7F] font-semibold">
-                        -{f.result.savingsPercent}% saved
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={(e) => handleRemoveFile(f.id, e)}
-                      className="opacity-0 group-hover:opacity-100 rounded-full p-1 text-[#4F4E55] hover:text-red-600 transition-opacity"
-                      aria-label={`Remove ${f.name}`}
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Cleaning Options & Presets Panel */}
-          <div className="rounded-3xl border border-[#E5E1D6] bg-[#F4F2EC] p-5 sm:p-7 shadow-xs space-y-6">
-            {/* Presets Toggle Header */}
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-[#E5E1D6]">
-              <div>
-                <h4 className="text-base font-bold text-[#0B0B0D]">
-                  Cleaning Options &amp; Presets
-                </h4>
-                <p className="text-xs text-[#4F4E55]">
-                  Select a preset or customize individual rules below
-                </p>
-              </div>
-
-              <div className="inline-flex rounded-xl border border-[#E5E1D6] bg-white p-1 shadow-2xs self-start sm:self-auto">
-                <button
-                  type="button"
-                  onClick={() => handlePresetSelect('safe')}
-                  className={`min-h-[36px] rounded-lg px-4 text-xs font-bold transition-all ${
-                    preset === 'safe'
-                      ? 'bg-[#0B0B0D] text-white shadow-xs'
-                      : 'text-[#4F4E55] hover:text-[#0B0B0D]'
-                  }`}
-                >
-                  Safe (Recommended)
+                  <UploadCloud className="h-3.5 w-3.5 text-[#5846F6]" />
+                  <span>Add More</span>
                 </button>
                 <button
                   type="button"
-                  onClick={() => handlePresetSelect('maximum')}
-                  className={`min-h-[36px] rounded-lg px-4 text-xs font-bold transition-all ${
-                    preset === 'maximum'
-                      ? 'bg-[#1F8C7F] text-white shadow-xs'
-                      : 'text-[#4F4E55] hover:text-[#0B0B0D]'
-                  }`}
+                  onClick={() => {
+                    setFiles([]);
+                    setActiveFileId(null);
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-red-200 bg-white px-3 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50"
                 >
-                  Maximum
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>Clear</span>
                 </button>
               </div>
             </div>
 
-            {/* Checkbox Options Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {/* Safe Options Column */}
-              <div className="rounded-2xl border border-[#E5E1D6] bg-white p-5 space-y-3.5 shadow-2xs">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                  <p className="text-xs font-mono font-bold uppercase tracking-wider text-[#0B0B0D]">
-                    Safe Rules (Zero Visual Risk)
-                  </p>
+            {/* TAB 1: VISUAL PREVIEW & TOGGLES */}
+            {activeViewTab === 'preview' && activeFile && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+                {/* Left: Preview Canvas & File Selection */}
+                <div className="lg:col-span-5 space-y-4">
+                  <div className="rounded-2xl border border-[#C9C7C1] bg-white p-5 space-y-4 shadow-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-[#0B0B0D] truncate max-w-[200px]">
+                        {activeFile.name}
+                      </span>
+                      <span className="text-xs font-mono font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                        Saved {activeFile.result.savingsPercent}%
+                      </span>
+                    </div>
+
+                    {/* SVG Render Box */}
+                    <div
+                      className="relative aspect-square w-full rounded-2xl overflow-hidden border border-[#C9C7C1] bg-transparency-grid flex items-center justify-center p-6"
+                      dangerouslySetInnerHTML={{ __html: activeFile.result.cleanedSvg }}
+                    />
+
+                    {/* Size and Savings Readout */}
+                    <div className="flex items-center justify-between text-xs text-[#4F4E55] pt-1">
+                      <span>Before: <strong>{formatBytes(activeFile.result.originalBytes)}</strong></span>
+                      <ArrowRight className="h-3.5 w-3.5 text-neutral-400" />
+                      <span>After: <strong className="text-emerald-700">{formatBytes(activeFile.result.cleanedBytes)}</strong></span>
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex items-center gap-2 pt-2">
+                      <button
+                        type="button"
+                        onClick={handleCopyCode}
+                        className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl border border-[#C9C7C1] bg-white hover:border-[#5846F6] hover:text-[#5846F6] text-[#0B0B0D] py-2 text-xs font-bold transition-all shadow-2xs"
+                      >
+                        {copiedCode ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
+                        <span>{copiedCode ? 'Copied' : 'Copy SVG'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadSingleSvg(activeFile)}
+                        className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#5846F6] hover:bg-[#4735E2] text-white py-2 text-xs font-bold transition-all shadow-xs"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        <span>Download</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* SVG to PNG Rasterizer Box (Phase 2) */}
+                  <div className="rounded-2xl border border-[#C9C7C1] bg-[#F4F2EC] p-5 space-y-3">
+                    <span className="text-xs font-bold uppercase tracking-wider text-[#0B0B0D] flex items-center gap-1.5">
+                      <ImageIcon className="h-4 w-4 text-[#5846F6]" />
+                      <span>Export as High-Res PNG</span>
+                    </span>
+
+                    <div className="grid grid-cols-3 gap-2">
+                      {([512, 1024, 2000] as (512 | 1024 | 2000)[]).map((dim) => (
+                        <button
+                          key={dim}
+                          type="button"
+                          onClick={() => setPngDimension(dim)}
+                          className={`py-1.5 text-xs font-bold rounded-lg border transition-all ${
+                            pngDimension === dim
+                              ? 'border-[#5846F6] bg-white text-[#5846F6] shadow-2xs'
+                              : 'border-[#C9C7C1] bg-white/70 text-[#4F4E55] hover:bg-white'
+                          }`}
+                        >
+                          {dim}px
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs pt-1">
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setPngBackground('transparent')}
+                          className={`px-2 py-1 rounded text-[11px] font-semibold border ${
+                            pngBackground === 'transparent' ? 'bg-white border-[#5846F6] text-[#5846F6]' : 'border-[#C9C7C1] text-[#4F4E55]'
+                          }`}
+                        >
+                          Transparent
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPngBackground('white')}
+                          className={`px-2 py-1 rounded text-[11px] font-semibold border ${
+                            pngBackground === 'white' ? 'bg-white border-[#5846F6] text-[#5846F6]' : 'border-[#C9C7C1] text-[#4F4E55]'
+                          }`}
+                        >
+                          White Bg
+                        </button>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleRasterizePng}
+                        disabled={isRasterizing}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-[#0B0B0D] hover:bg-[#5846F6] text-white px-3 py-1.5 text-xs font-bold transition-all shadow-xs"
+                      >
+                        {isRasterizing ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+                        <span>PNG</span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
-                {[
-                  {
-                    key: 'removeComments' as const,
-                    label: 'Remove XML comments',
-                    desc: 'Strips generator headers & developer remarks',
-                  },
-                  {
-                    key: 'removeMetadata' as const,
-                    label: 'Remove XML metadata & doctype',
-                    desc: 'Strips <metadata>, <?xml ...?>, and <!DOCTYPE>',
-                  },
-                  {
-                    key: 'removeEditorData' as const,
-                    label: 'Remove editor data',
-                    desc: 'Illustrator, Inkscape & Figma proprietary tags',
-                  },
-                  {
-                    key: 'removeEmptyGroups' as const,
-                    label: 'Remove empty groups',
-                    desc: 'Deletes redundant empty <g> containers',
-                  },
-                  {
-                    key: 'removeHiddenElements' as const,
-                    label: 'Remove hidden elements',
-                    desc: 'Removes display="none" and opacity="0" nodes',
-                  },
-                  {
-                    key: 'removeUnusedDefs' as const,
-                    label: 'Remove unused defs',
-                    desc: 'Deletes unreferenced gradients, clips & filters',
-                  },
-                ].map((item) => (
-                  <label
-                    key={item.key}
-                    className="flex items-start gap-3 cursor-pointer group"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={options[item.key]}
-                      onChange={() => handleOptionToggle(item.key)}
-                      className="mt-0.5 h-4 w-4 rounded border-[#E5E1D6] text-[#1F8C7F] focus:ring-[#1F8C7F]"
-                    />
+                {/* Right: Optimization Toggles & Breakdown */}
+                <div className="lg:col-span-7 space-y-6">
+                  {/* Removal Breakdown Summary Card */}
+                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-4 flex items-center justify-between gap-3 text-emerald-900 text-xs">
                     <div>
-                      <p className="text-xs font-bold text-[#0B0B0D] group-hover:text-[#1F8C7F] transition-colors">
-                        {item.label}
-                      </p>
-                      <p className="text-[11px] text-[#4F4E55]">{item.desc}</p>
+                      <p className="font-bold">Breakdown of Cleaned Assets:</p>
+                      <p className="text-emerald-800 mt-0.5">{activeFile.result.removals.summary}</p>
                     </div>
-                  </label>
-                ))}
+                  </div>
+
+                  {/* Cleaning Options Checklist */}
+                  <div className="rounded-2xl border border-[#C9C7C1] bg-white p-6 space-y-5 shadow-xs">
+                    <h3 className="text-sm font-extrabold text-[#0B0B0D]">
+                      Optimization Settings & Advanced Toggles
+                    </h3>
+
+                    <div className="space-y-3">
+                      {[
+                        { key: 'removeComments', label: 'Remove XML & editor comments', desc: 'Safely removes comment lines' },
+                        { key: 'removeMetadata', label: 'Strip <metadata>, <title>, <desc>', desc: 'Removes non-visual metadata' },
+                        { key: 'removeEditorData', label: 'Remove Illustrator / Figma / Inkscape data', desc: 'Strips proprietary namespace attributes' },
+                        { key: 'removeEmptyGroups', label: 'Remove empty <g> groups', desc: 'Cleans nested empty tags' },
+                        { key: 'removeHiddenElements', label: 'Remove hidden elements (display:none)', desc: 'Strips unused invisible shapes' },
+                        { key: 'removeUnusedDefs', label: 'Remove unused <defs> and gradients', desc: 'Cleans unreferenced resources' },
+                        { key: 'minifyStyles', label: 'Minify CSS styles & inline styles', desc: 'Compresses whitespace in stylesheets' },
+                        { key: 'removeDimensionsKeepViewBox', label: 'Remove width/height (Keep viewBox)', desc: 'Makes SVG responsively scalable' },
+                        { key: 'roundCoordinates', label: 'Round path coordinates to 2 decimals', desc: 'Reduces precision float bloat' },
+                        { key: 'prettyPrint', label: 'Pretty-print formatted XML with indentation', desc: 'Formats readable multi-line code' },
+                      ].map((item) => (
+                        <label
+                          key={item.key}
+                          className="flex items-start gap-3 cursor-pointer p-2 rounded-xl hover:bg-[#F4F2EC] transition-colors"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={!!options[item.key as keyof CleaningOptions]}
+                            onChange={() => handleOptionToggle(item.key as keyof CleaningOptions)}
+                            className="mt-1 h-4 w-4 rounded border-[#C9C7C1] text-[#5846F6] focus:ring-[#5846F6] cursor-pointer"
+                          />
+                          <div>
+                            <span className="text-xs font-bold text-[#0B0B0D] block">{item.label}</span>
+                            <span className="text-[11px] text-[#4F4E55]">{item.desc}</span>
+                          </div>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </div>
               </div>
+            )}
 
-              {/* Aggressive Options Column */}
-              <div className="rounded-2xl border border-[#E5E1D6] bg-white p-5 space-y-3.5 shadow-2xs">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="h-2 w-2 rounded-full bg-amber-500" />
-                  <p className="text-xs font-mono font-bold uppercase tracking-wider text-[#0B0B0D]">
-                    Aggressive Rules (Maximum Savings)
-                  </p>
-                </div>
-
-                {[
-                  {
-                    key: 'roundCoordinates' as const,
-                    label: 'Round coordinates to 2 decimal places',
-                    desc: 'Rounds bloated 8-digit floating points in paths',
-                  },
-                  {
-                    key: 'shortenIds' as const,
-                    label: 'Shorten IDs',
-                    desc: 'Replaces long UUIDs with minimal characters',
-                  },
-                  {
-                    key: 'removeDimensionsKeepViewBox' as const,
-                    label: 'Remove width/height (keep viewBox)',
-                    desc: 'Enables responsive vector fluid scaling',
-                  },
-                  {
-                    key: 'minifyCode' as const,
-                    label: 'Minify code',
-                    desc: 'Collapses whitespace & line breaks',
-                  },
-                ].map((item) => (
-                  <label
-                    key={item.key}
-                    className="flex items-start gap-3 cursor-pointer group"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={options[item.key]}
-                      onChange={() => handleOptionToggle(item.key)}
-                      className="mt-0.5 h-4 w-4 rounded border-[#E5E1D6] text-[#1F8C7F] focus:ring-[#1F8C7F]"
-                    />
-                    <div>
-                      <p className="text-xs font-bold text-[#0B0B0D] group-hover:text-[#1F8C7F] transition-colors">
-                        {item.label}
-                      </p>
-                      <p className="text-[11px] text-[#4F4E55]">{item.desc}</p>
-                    </div>
-                  </label>
-                ))}
-
-                {/* Aggressive Warning Callout */}
-                {hasAggressiveActive && (
-                  <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-amber-900 text-xs flex items-start gap-2">
-                    <AlertCircle className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
-                    <span>
-                      Aggressive may change very small details. Check the preview
-                      before you download.
+            {/* TAB 2: CLEANED CODE VIEW WITH LINE NUMBERS (Phase 2) */}
+            {activeViewTab === 'code' && activeFile && (
+              <div className="rounded-3xl border border-[#C9C7C1] bg-white p-6 space-y-4 shadow-xs">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Code2 className="h-4 w-4 text-[#5846F6]" />
+                    <span className="text-xs font-bold text-[#0B0B0D]">
+                      Cleaned Code: {activeFile.name}
                     </span>
                   </div>
-                )}
-              </div>
-            </div>
-          </div>
 
-          {/* Active File Optimization Stats Banner */}
-          {activeFile && (
-            <div className="rounded-3xl border border-[#E5E1D6] bg-white p-5 sm:p-7 shadow-sm">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-[#E5E1D6]">
-                <div>
-                  <div className="inline-flex items-center gap-2 rounded-md bg-[#EBF7F5] px-2.5 py-1 text-xs font-mono font-bold text-[#1F8C7F] mb-1.5">
-                    <span>
-                      {formatBytes(activeFile.result.originalBytes)} &rarr;{' '}
-                      {formatBytes(activeFile.result.cleanedBytes)} ({activeFile.result.savingsPercent}% smaller)
-                    </span>
-                  </div>
-                  <h3 className="text-lg font-bold text-[#0B0B0D] truncate">
-                    {activeFile.name}
-                  </h3>
-                  <p className="text-xs text-[#4F4E55]">
-                    Reduced code payload by {formatBytes(activeFile.result.savingsBytes)} •{' '}
-                    {activeFile.result.elementCountBefore} &rarr;{' '}
-                    {activeFile.result.elementCountAfter} elements
-                  </p>
-                </div>
-
-                {/* Primary Export Actions */}
-                <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
                     onClick={handleCopyCode}
-                    className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl border border-[#E5E1D6] bg-white hover:bg-[#F4F2EC] px-4 py-2 text-xs font-semibold text-[#0B0B0D] transition-all shadow-2xs"
+                    className="inline-flex items-center gap-1.5 rounded-full bg-[#5846F6] hover:bg-[#4735E2] text-white px-4 py-1.5 text-xs font-bold shadow-xs transition-all"
                   >
-                    {copiedCode ? (
-                      <>
-                        <Check className="h-4 w-4 text-emerald-600" />
-                        <span>Code Copied!</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="h-4 w-4 text-[#4F4E55]" />
-                        <span>Copy Cleaned SVG Code</span>
-                      </>
-                    )}
+                    {copiedCode ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                    <span>{copiedCode ? 'Copied' : 'Copy Code'}</span>
                   </button>
+                </div>
 
-                  <button
-                    type="button"
-                    onClick={handleDownloadSingle}
-                    className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl bg-[#0B0B0D] hover:bg-[#1F8C7F] text-white px-5 py-2 text-xs font-bold transition-all shadow-sm"
-                  >
-                    <Download className="h-4 w-4" />
-                    <span>Download Cleaned SVG</span>
-                  </button>
+                {/* Monospace Code Box with Line Numbers */}
+                <div className="rounded-2xl border border-[#C9C7C1] bg-[#0B0B0D] text-neutral-200 p-4 font-mono text-xs max-h-[500px] overflow-y-auto flex">
+                  {/* Line Numbers Column */}
+                  <div className="select-none text-neutral-600 pr-4 text-right border-r border-neutral-800 space-y-1">
+                    {activeFile.result.cleanedSvg.split('\n').map((_, i) => (
+                      <div key={i}>{i + 1}</div>
+                    ))}
+                  </div>
 
+                  {/* Code Column */}
+                  <pre className="pl-4 whitespace-pre-wrap break-all flex-1 text-emerald-400">
+                    <code>{activeFile.result.cleanedSvg}</code>
+                  </pre>
+                </div>
+              </div>
+            )}
+
+            {/* TAB 3: RESULTS TABLE WITH BREAKDOWN (Phase 2) */}
+            {activeViewTab === 'table' && (
+              <div className="rounded-3xl border border-[#C9C7C1] bg-white p-6 space-y-4 shadow-xs overflow-x-auto">
+                <div className="flex items-center justify-between pb-3 border-b border-[#C9C7C1]">
+                  <div>
+                    <h3 className="text-sm font-extrabold text-[#0B0B0D]">Batch Optimization Table</h3>
+                    <p className="text-xs text-[#4F4E55]">Detailed breakdown of removals per file</p>
+                  </div>
                   <button
                     type="button"
                     onClick={handleDownloadAllZip}
                     disabled={isZipping}
-                    className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl border border-[#E5E1D6] bg-white hover:bg-[#F4F2EC] px-4 py-2 text-xs font-bold text-[#0B0B0D] transition-all shadow-2xs"
+                    className="inline-flex items-center gap-1.5 rounded-full bg-[#5846F6] hover:bg-[#4735E2] text-white px-4 py-2 text-xs font-bold shadow-md"
                   >
-                    <FileArchive className="h-4 w-4 text-[#1F8C7F]" />
-                    <span>{isZipping ? 'Zipping...' : files.length > 1 ? `Download All (${files.length}) as ZIP` : 'Download All as ZIP'}</span>
+                    {isZipping ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <FileArchive className="h-3.5 w-3.5" />}
+                    <span>Download All (ZIP)</span>
                   </button>
                 </div>
+
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-[#C9C7C1] text-[#4F4E55] uppercase text-[10px] tracking-wider">
+                      <th className="py-2.5 px-3">File Name</th>
+                      <th className="py-2.5 px-3">Original</th>
+                      <th className="py-2.5 px-3">Cleaned</th>
+                      <th className="py-2.5 px-3">Saved</th>
+                      <th className="py-2.5 px-3">Removal Breakdown</th>
+                      <th className="py-2.5 px-3 text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#C9C7C1]/50">
+                    {files.map((item) => (
+                      <tr key={item.id} className="hover:bg-[#F4F2EC]/50">
+                        <td className="py-3 px-3 font-semibold text-[#0B0B0D] max-w-[180px] truncate">
+                          {item.name}
+                        </td>
+                        <td className="py-3 px-3 font-mono text-[#4F4E55]">
+                          {formatBytes(item.result.originalBytes)}
+                        </td>
+                        <td className="py-3 px-3 font-mono font-bold text-emerald-700">
+                          {formatBytes(item.result.cleanedBytes)}
+                        </td>
+                        <td className="py-3 px-3 font-bold text-emerald-600">
+                          {item.result.savingsPercent}%
+                        </td>
+                        <td className="py-3 px-3 text-[11px] text-[#4F4E55]">
+                          {item.result.removals.summary}
+                        </td>
+                        <td className="py-3 px-3 text-right">
+                          <button
+                            type="button"
+                            onClick={() => handleDownloadSingleSvg(item)}
+                            className="p-1.5 rounded-lg border border-[#C9C7C1] hover:border-[#5846F6] hover:text-[#5846F6] text-[#0B0B0D] bg-white inline-flex items-center"
+                            title={`Download ${item.name}`}
+                          >
+                            <Download className="h-3.5 w-3.5" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {/* Combined Total Row (Phase 2) */}
+                    <tr className="bg-[#F4F2EC] font-bold text-[#0B0B0D]">
+                      <td className="py-3 px-3 uppercase text-[11px]">Total ({files.length} SVGs)</td>
+                      <td className="py-3 px-3 font-mono">{formatBytes(totalOriginalBytes)}</td>
+                      <td className="py-3 px-3 font-mono text-emerald-700">{formatBytes(totalCleanedBytes)}</td>
+                      <td className="py-3 px-3 text-emerald-700">{totalSavingsPercent}% Saved</td>
+                      <td className="py-3 px-3 text-[11px] text-[#4F4E55]">
+                        Combined savings: {formatBytes(totalSavedBytes)}
+                      </td>
+                      <td className="py-3 px-3 text-right">
+                        <button
+                          type="button"
+                          onClick={handleDownloadAllZip}
+                          className="text-xs text-[#5846F6] underline"
+                        >
+                          ZIP All
+                        </button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
+            )}
+          </div>
+        )}
+      </div>
 
-              {/* Side-by-Side Synchronized Visual Comparison */}
-              <div className="mt-6">
-                <div className="flex items-center justify-between mb-3 px-1">
-                  <p className="text-xs font-mono uppercase tracking-wider text-[#4F4E55] font-semibold">
-                    Visual Diff: Before vs. After
-                  </p>
-                  <p className="text-xs text-[#4F4E55]">
-                    Checkerboard confirms transparent background &amp; zero visual shift
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {/* Before Preview */}
-                  <div className="rounded-2xl border border-[#E5E1D6] bg-white p-4">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-xs font-mono font-bold text-[#4F4E55]">
-                        Original (Before)
-                      </span>
-                      <span className="text-xs font-mono text-[#4F4E55]">
-                        {formatBytes(activeFile.result.originalBytes)} •{' '}
-                        {activeFile.result.elementCountBefore} elements
-                      </span>
-                    </div>
-                    <div className="relative h-64 sm:h-72 w-full overflow-hidden rounded-xl border border-[#E5E1D6] bg-transparency-grid flex items-center justify-center p-4">
-                      <div
-                        className="h-full w-full flex items-center justify-center [&>svg]:max-h-full [&>svg]:max-w-full [&>svg]:h-auto [&>svg]:w-auto"
-                        dangerouslySetInnerHTML={{ __html: activeFile.originalRaw }}
-                      />
-                    </div>
-                  </div>
-
-                  {/* After Preview */}
-                  <div className="rounded-2xl border-2 border-[#1F8C7F]/30 bg-white p-4 shadow-2xs">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-xs font-mono font-bold text-[#1F8C7F]">
-                        Cleaned (After)
-                      </span>
-                      <span className="text-xs font-mono text-[#1F8C7F] font-bold">
-                        {formatBytes(activeFile.result.cleanedBytes)} (-{activeFile.result.savingsPercent}%) •{' '}
-                        {activeFile.result.elementCountAfter} elements
-                      </span>
-                    </div>
-                    <div className="relative h-64 sm:h-72 w-full overflow-hidden rounded-xl border border-[#E5E1D6] bg-transparency-grid flex items-center justify-center p-4">
-                      <div
-                        className="h-full w-full flex items-center justify-center [&>svg]:max-h-full [&>svg]:max-w-full [&>svg]:h-auto [&>svg]:w-auto"
-                        dangerouslySetInnerHTML={{ __html: activeFile.result.cleanedSvg }}
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Privacy Badge */}
-      <div className="mt-8 flex items-center justify-center">
-        <div className="inline-flex items-center gap-2 rounded-full border border-[#E5E1D6] bg-[#F4F2EC] px-4 py-2 text-xs font-medium text-[#4F4E55]">
-          <ShieldCheck className="h-4 w-4 text-[#1F8C7F]" />
-          <span>
-            100% private. Your SVG is processed in your browser and never uploaded.
-          </span>
-        </div>
+      {/* PRIVACY BADGE */}
+      <div className="rounded-2xl border border-[#C9C7C1] bg-white p-4 text-center max-w-xl mx-auto flex items-center justify-center gap-2.5 text-xs sm:text-sm font-semibold text-[#0B0B0D]">
+        <ShieldCheck className="h-4 w-4 shrink-0 text-[#5846F6]" />
+        <span>100% private. All SVG parsing and optimization runs client-side in your browser.</span>
       </div>
     </div>
   );

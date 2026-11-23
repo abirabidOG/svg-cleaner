@@ -58,3 +58,43 @@ export function trackDownloadSvgClean(params: {
     console.debug('[Analytics] Failed to track download_svg_clean', err);
   }
 }
+
+/**
+ * Phase 2 Events
+ */
+export function trackCodePasted(codeLength: number) {
+  if (typeof window === 'undefined' || typeof window.gtag !== 'function') return;
+  try {
+    window.gtag('event', 'code_pasted', {
+      code_length: codeLength,
+      tool: 'svg-cleaner',
+    });
+  } catch (err) {
+    console.debug('[Analytics] Failed to track code_pasted', err);
+  }
+}
+
+export function trackSvgToPng(size: number, background: 'transparent' | 'white') {
+  if (typeof window === 'undefined' || typeof window.gtag !== 'function') return;
+  try {
+    window.gtag('event', 'svg_to_png', {
+      raster_size: size,
+      background,
+      tool: 'svg-cleaner',
+    });
+  } catch (err) {
+    console.debug('[Analytics] Failed to track svg_to_png', err);
+  }
+}
+
+export function trackPresetChanged(presetName: string) {
+  if (typeof window === 'undefined' || typeof window.gtag !== 'function') return;
+  try {
+    window.gtag('event', 'preset_changed', {
+      preset: presetName,
+      tool: 'svg-cleaner',
+    });
+  } catch (err) {
+    console.debug('[Analytics] Failed to track preset_changed', err);
+  }
+}
